@@ -1,0 +1,109 @@
+# =============================================================================
+# Configuração do simulador. TUDO que muda entre cenários vem de variável de
+# ambiente, para o orquestrador trocar o cenário sem rebuild da imagem.
+# Padrões = valores de produção (README, seção 2).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Parâmetros do simulador (classe SimProperties)
+# -----------------------------------------------------------------------------
+sim:
+  task-id: ${TASK_ID:${HOSTNAME:local}}
+
+  # Comportamento ao receber SIGTERM:
+  #   DEFAULT  -> padrão do Spring Cloud AWS 2.x: para o poll, espera até 20s, interrompe o resto.
+  #               (só vale com entrypoint exec; com entrypoint shell o Java nem recebe o SIGTERM)
+  #   GRACEFUL -> para de ler o SQS, termina o que está em voo, depois fecha o Kafka.
+  shutdown-mode: ${SIM_SHUTDOWN_MODE:DEFAULT}
+
+  sla-timeout: ${SIM_SLA_TIMEOUT:26s}
+  # Tempo máximo do graceful (precisa ser < stopTimeout do ECS).
+  graceful-timeout: ${SIM_GRACEFUL_TIMEOUT:25s}
+
+  sqs:
+    endpoint: ${SQS_ENDPOINT:http://localhost:9324}
+    region: us-east-1
+    input-queue: ${SQS_INPUT_QUEUE:bench-input}
+    final-queue: ${SQS_FINAL_QUEUE:bench-final}
+    # Defaults do Spring Cloud AWS 2.4.4 (produção sem config de threads):
+    # 1 thread de poll por fila, até maxMessages+1 = 11 workers, long poll 20s,
+    # novo poll só após o lote inteiro, stop espera até 20s.
+    poller-threads: ${SQS_POLLER_THREADS:1}
+    worker-threads: ${SQS_WORKER_THREADS:11}
+    max-messages: ${SQS_MAX_MESSAGES:10}
+    wait-seconds: ${SQS_WAIT_SECONDS:20}
+    batch-wait: ${SQS_BATCH_WAIT:true}
+    queue-stop-timeout: ${SQS_QUEUE_STOP_TIMEOUT:20s}
+
+  topics:
+    request: ${TOPIC_REQUEST:bench-request}
+    response: ${TOPIC_RESPONSE:bench-response}
+
+  kafka:
+    # Consumer group do tópico de resposta: o mesmo para todas as tasks (como em produção).
+    reply-group-id: ${KAFKA_REPLY_GROUP_ID:bench-reply}
+
+  # Latências simuladas: base + aleatório(0..jitter) + (slow-ms com probabilidade slow-rate).
+  # Produção: ~1s somando tudo. Divisão estimada: API 250 + integração 500 + Dynamo 3x40 + jitter.
+  # No pico usar Dynamo 10ms (LAT_DYNAMO_*): a 40ms o listener de resposta satura antes de 10 msg/s por partição.
+  latency:
+    api:
+      base-ms: ${LAT_API_BASE_MS:250}
+      jitter-ms: ${LAT_API_JITTER_MS:100}
+      slow-rate: ${LAT_API_SLOW_RATE:0.01}
+      slow-ms: ${LAT_API_SLOW_MS:1000}
+    dynamo-write:
+      base-ms: ${LAT_DYNAMO_WRITE_BASE_MS:40}
+      jitter-ms: ${LAT_DYNAMO_WRITE_JITTER_MS:20}
+    dynamo-read:
+      base-ms: ${LAT_DYNAMO_READ_BASE_MS:40}
+      jitter-ms: ${LAT_DYNAMO_READ_JITTER_MS:20}
+    integration:
+      base-ms: ${LAT_INTEGRATION_BASE_MS:500}
+      jitter-ms: ${LAT_INTEGRATION_JITTER_MS:200}
+      slow-rate: ${LAT_INTEGRATION_SLOW_RATE:0.01}
+      slow-ms: ${LAT_INTEGRATION_SLOW_MS:2000}
+
+  responder:
+    scheduler-threads: 4
+
+# -----------------------------------------------------------------------------
+# Kafka (Spring Boot). Aqui ficam as variáveis das sugestões 2 e extras.
+# -----------------------------------------------------------------------------
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+    consumer:
+      auto-offset-reset: ${KAFKA_AUTO_OFFSET_RESET:latest}
+      max-poll-records: ${KAFKA_MAX_POLL_RECORDS:500}
+      properties:
+        # Produção: Cooperative,Range -> assignor cooperative-sticky, mas protocolo EAGER
+        # (o Range só suporta eager). Só CooperativeStickyAssignor = protocolo cooperativo.
+        partition.assignment.strategy: ${KAFKA_ASSIGNORS:org.apache.kafka.clients.consumer.CooperativeStickyAssignor,org.apache.kafka.clients.consumer.RangeAssignor}
+        # Tempo para o grupo perceber um consumer morto SEM LeaveGroup (default do client 3.1 = 45s).
+        session.timeout.ms: ${KAFKA_SESSION_TIMEOUT_MS:45000}
+        heartbeat.interval.ms: ${KAFKA_HEARTBEAT_MS:3000}
+        max.poll.interval.ms: ${KAFKA_MAX_POLL_INTERVAL_MS:300000}
+    listener:
+      # Threads consumidoras por task (cada uma é um membro do grupo).
+      # Produção não configura -> default do Spring Kafka = 1 consumer por task.
+      concurrency: ${KAFKA_LISTENER_CONCURRENCY:1}
+
+  lifecycle:
+    # Quanto o Spring espera cada fase de shutdown (Kafka containers, etc.).
+    timeout-per-shutdown-phase: ${SIM_PHASE_TIMEOUT:30s}
+
+# Só o health é exposto (o orquestrador usa para saber quando a task está pronta).
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+# Logs curtos. Os eventos de métrica saem no logger "EVT" (ver Events.java).
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level %logger{20} - %msg%n"
+  level:
+    org.apache.kafka: WARN
+    org.apache.kafka.clients.consumer.internals.ConsumerCoordinator: INFO

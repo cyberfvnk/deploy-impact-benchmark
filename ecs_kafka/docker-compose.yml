@@ -1,0 +1,153 @@
+# =============================================================================
+# Infraestrutura FIXA do benchmark (não é redeployada durante os cenários)
+#
+#   kafka       -> broker real (KRaft, sem Zookeeper). É a variável sob teste.
+#   kafka-init  -> cria os tópicos uma vez e morre.
+#   elasticmq   -> SQS compatível (precisamos do visibility timeout real).
+#   responder   -> simula a INTEGRAÇÃO externa: lê o tópico de request e
+#                  devolve no tópico de response após uma latência.
+#
+# As TASKS da aplicação NÃO ficam aqui: quem sobe/derruba é o orquestrador
+# (script Python, próximo passo), imitando o rolling deploy do ECS.
+# Exceção: o serviço "task-smoke" (profile "smoke") para teste manual rápido.
+#
+# Parâmetros de cenário ficam no arquivo .env (lido automaticamente).
+# =============================================================================
+
+name: kafka-bench
+
+# Variáveis comuns a qualquer container da aplicação (task ou responder).
+x-app-env: &app-env
+  KAFKA_BOOTSTRAP: kafka:9092
+  SQS_ENDPOINT: http://elasticmq:9324
+  TOPIC_REQUEST: bench-request
+  TOPIC_RESPONSE: bench-response
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kafka em modo KRaft (broker + controller no mesmo processo).
+  # Dois listeners:
+  #   INTERNAL kafka:9092      -> usado pelos containers na rede do compose
+  #   EXTERNAL localhost:29092 -> usado por scripts rodando no Mac
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # Um broker só -> replication factor 1 nos tópicos internos.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Atraso do 1º rebalance de um grupo novo (padrão do Kafka/MSK).
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: ${GROUP_INITIAL_REBALANCE_DELAY_MS:-3000}
+      KAFKA_HEAP_OPTS: -Xms768m -Xmx768m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    mem_limit: 1g
+
+  # ---------------------------------------------------------------------------
+  # Cria os tópicos com o número de partições do cenário (.env) e termina.
+  # Partições definem o paralelismo máximo: consumers > partições ficam ociosos.
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:3.8.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic bench-request  --partitions ${REQUEST_PARTITIONS:-12}  --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic bench-response --partitions ${RESPONSE_PARTITIONS:-12} --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # ElasticMQ: implementação do protocolo SQS. Filas definidas em
+  # infra/elasticmq.conf (bench-input e bench-final).
+  # Porta 9325 = UI web para inspecionar as filas (http://localhost:9325).
+  # ---------------------------------------------------------------------------
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.9
+    container_name: elasticmq
+    ports:
+      - "9324:9324"
+      - "9325:9325"
+    environment:
+      # Visibility timeout da fila de entrada. É ELE que define quando uma msg
+      # "perdida" num SIGTERM volta a ser entregue (produção: 30s).
+      INPUT_VISIBILITY_TIMEOUT: ${SQS_VISIBILITY_TIMEOUT:-30 seconds}
+    volumes:
+      - ./infra/elasticmq.conf:/opt/elasticmq.conf:ro
+    mem_limit: 256m
+
+  # ---------------------------------------------------------------------------
+  # Responder = a integração externa. Mesmo jar, profile "responder".
+  # Fica FORA do deploy: em produção a integração não reinicia junto com a app.
+  # ---------------------------------------------------------------------------
+  responder:
+    build:
+      context: ./simulator
+      args:
+        ENTRYPOINT_MODE: exec
+    image: bench-sim:exec
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: responder
+      TASK_ID: responder
+      # Latência da integração (tempo entre request e response no Kafka).
+      LAT_INTEGRATION_BASE_MS: ${LAT_INTEGRATION_BASE_MS:-300}
+      LAT_INTEGRATION_JITTER_MS: ${LAT_INTEGRATION_JITTER_MS:-200}
+      LAT_INTEGRATION_SLOW_RATE: ${LAT_INTEGRATION_SLOW_RATE:-0.01}
+      LAT_INTEGRATION_SLOW_MS: ${LAT_INTEGRATION_SLOW_MS:-3000}
+    mem_limit: 512m
+
+  # ---------------------------------------------------------------------------
+  # Imagem "shell": mesma app, mas com ENTRYPOINT que NÃO repassa SIGTERM
+  # ao Java (anti-padrão comum). Só é construída aqui; quem usa é o
+  # orquestrador. `docker compose build` gera as duas imagens.
+  # ---------------------------------------------------------------------------
+  image-shell:
+    build:
+      context: ./simulator
+      args:
+        ENTRYPOINT_MODE: shell
+    image: bench-sim:shell
+    profiles: ["build-only"]
+
+  # ---------------------------------------------------------------------------
+  # Task avulsa para teste manual:  docker compose --profile smoke up task-smoke
+  # ---------------------------------------------------------------------------
+  task-smoke:
+    image: bench-sim:exec
+    profiles: ["smoke"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      elasticmq:
+        condition: service_started
+    environment:
+      <<: *app-env
+      TASK_ID: smoke-1
+    stop_grace_period: 30s   # equivalente ao stopTimeout do ECS
+    mem_limit: 512m
+    cpus: 0.5
